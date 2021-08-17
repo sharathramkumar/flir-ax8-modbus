@@ -7,13 +7,18 @@ Date       : 23-07-2021
 """
 
 from pyModbusTCP.client import ModbusClient
-from ax8_modbus_utils import parse_float, float_to_modbus, int_to_modbus
+from ax8_camera_feed import Ax8CameraFeed
+from ax8_modbus_utils import parse_float, float_to_modbus, parse_int, int_to_modbus
 from ax8_modbus_regs import SPOTMETER_REGS
+
+import numpy as np
 
 class Ax8ThermalCamera:
 
-    def __init__(self, ip_address:str, verbose:bool = True):
-        """        
+    def __init__(self, ip_address:str, encoding:str = "avc", overlay:bool = False, verbose:bool = True):
+        """
+        Provides an interface to the Ax8 Thermal Camera through its modbus TCP and its video stream.
+        
         Parameters
         ----------
         ip_address : str
@@ -38,6 +43,7 @@ class Ax8ThermalCamera:
         # Port opened succesfully
         if self.verbose:
                 print("Established Modbus TCP at", self.modbus.host())
+        self.video = Ax8CameraFeed(ip_address, encoding, overlay)
         # Set default spotmeter parameters
         self.__default_params = {
                 'reflected_temp': 298.0,
@@ -110,11 +116,11 @@ class Ax8ThermalCamera:
             base_reg_addr = (inst*4000)
             if use_local_params:
                 self.modbus.write_multiple_registers(base_reg_addr + SPOTMETER_REGS['ENABLE_LOCAL_PARAMS'], [1, 1])
-                self.modbus_write_multiple_registers(base_reg_addr + SPOTMETER_REGS['REFLECTED_TEMP'], float_to_modbus(self.spotmeter_params['reflected_temp']))
-                self.modbus_write_multiple_registers(base_reg_addr + SPOTMETER_REGS['EMISSIVITY'], float_to_modbus(self.spotmeter_params['emissivity']))
-                self.modbus_write_multiple_registers(base_reg_addr + SPOTMETER_REGS['DISTANCE'], float_to_modbus(self.spotmeter_params['distance']))
+                self.modbus.write_multiple_registers(base_reg_addr + SPOTMETER_REGS['REFLECTED_TEMP'], float_to_modbus(self.spotmeter_params['reflected_temp']))
+                self.modbus.write_multiple_registers(base_reg_addr + SPOTMETER_REGS['EMISSIVITY'], float_to_modbus(self.spotmeter_params['emissivity']))
+                self.modbus.write_multiple_registers(base_reg_addr + SPOTMETER_REGS['DISTANCE'], float_to_modbus(self.spotmeter_params['distance']))
             self.modbus.write_multiple_registers(base_reg_addr + SPOTMETER_REGS['SPOT_X_POSITION'], int_to_modbus(spot_x))
-            self.modbus.write_multiple_registers(base_reg_addr + SPOTMETER_REGS['SPOT_Y_POSITION'], int_to_modbus(spot_x))
+            self.modbus.write_multiple_registers(base_reg_addr + SPOTMETER_REGS['SPOT_Y_POSITION'], int_to_modbus(spot_y))
             self.modbus.write_multiple_registers(base_reg_addr + SPOTMETER_REGS['ENABLE_SPOTMETER'], [1, 1])
             
             
@@ -148,9 +154,89 @@ class Ax8ThermalCamera:
         for inst in instances:
             base_reg_addr = (inst*4000)
             temp_raw = self.modbus.read_holding_registers(base_reg_addr + SPOTMETER_REGS['SPOT_TEMPERATURE'], 6)
-            val = parse_float(temp_raw[-2:]) + conv.get(unit, 0)
+            val = parse_float(temp_raw[-2:])[0] + conv.get(unit, 0)
             ret_vals.append(val)
         return ret_vals
-            
-        
-#cam = Ax8ThermalCamera("192.168.1.11")
+    
+    def get_spotmeter_position(self, instances:list):
+        """
+        Returns the spotmeter position as a list of tuples [(x1, y1), (x2, y2)...]. Assumes that the spotmeters are already enabled.
+
+        Parameters
+        ----------
+        instances : list
+            Spotmeter instance IDs for which position is to be returned.
+
+        Returns
+        -------
+        list of tuples 
+
+        """
+        self.modbus.unit_id(SPOTMETER_REGS['UNIT_ID'])
+        ret_vals = []
+        for inst in instances:
+            base_reg_addr = (inst * 4000)
+            this_spot_x = self.modbus.read_holding_registers(base_reg_addr + SPOTMETER_REGS['SPOT_X_POSITION'], 6)
+            this_spot_x = parse_int(this_spot_x[-2:])[0]
+            this_spot_y = self.modbus.read_holding_registers(base_reg_addr + SPOTMETER_REGS['SPOT_Y_POSITION'], 6)
+            this_spot_y = parse_int(this_spot_y[-2:])[0]
+            ret_vals.append((this_spot_x, this_spot_y))
+        return ret_vals
+    
+    def get_cutline_x(self, x:int, params:dict=None, unit:str='Celsius'):
+        """
+        Get a 1-D array of temperature values along the given cutline (fixed x, sweep y)
+
+        Parameters
+        ----------
+        x : int
+            The x pixel value for which the cutline is required; must be between 0 & 79 (inclusive).
+        params : dict, optional
+            The spotmeter paramters - if None, reuse the previously set parameters or the default parameters. The default is None.
+        unit : str, optional
+            Output temperature units, one of 'Kelvin' or 'Celsius'. The default is 'Celsius'.
+
+        Returns
+        -------
+        out : np.ndarray
+            A np array of shape (1, 60).
+
+        """
+        out = np.zeros((1,60))
+        if params:
+            self.set_spotmeter_params(params)
+        for ii in range(0,60,5):
+            self.enable_spotmeter(instances=[(1,x,ii), (2,x,ii+1), (3,x,ii+2), (4,x,ii+3), (5,x,ii+4)])
+            temps = self.get_spotmeter_temps([1,2,3,4,5], unit=unit)
+            for t in range(5):
+                out[0][ii+t] = temps[t]
+        return out
+    
+    def get_cutline_y(self, y:int, params:dict=None, unit:str='Celsius'):
+        """
+        Get a 1-D array of temperature values along the given cutline (fixed y, sweep x)
+
+        Parameters
+        ----------
+        y : int
+            The y pixel value for which the cutline is required; must be between 0 & 59 (inclusive).
+        params : dict, optional
+            The spotmeter paramters - if None, reuse the previously set parameters or the default parameters. The default is None.
+        unit : str, optional
+            Output temperature units, one of 'Kelvin' or 'Celsius'. The default is 'Celsius'.
+
+        Returns
+        -------
+        out : np.ndarray
+            A np array of shape (1, 80).
+
+        """
+        out = np.zeros((1,80))
+        if params:
+            self.set_spotmeter_params(params)
+        for ii in range(0,80,5):
+            self.enable_spotmeter(instances=[(1,ii,y), (2,ii+1,y), (3,ii+2,y), (4,ii+3,y), (5,ii+4,y)])
+            temps = self.get_spotmeter_temps([1,2,3,4,5], unit = unit)
+            for t in range(5):
+                out[0][ii+t] = temps[t]
+        return out
